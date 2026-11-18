@@ -1,0 +1,72 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { spawn, execFileSync } = require('node:child_process');
+const { once } = require('node:events');
+const { io } = require('socket.io-client');
+const root = path.resolve(__dirname,'..');
+const temp = fs.mkdtempSync(path.join(os.tmpdir(),'streamlab-test-'));
+for (const file of ['server.js','db.js']) fs.copyFileSync(path.join(root,file),path.join(temp,file));
+fs.symlinkSync(path.join(root,'node_modules'),path.join(temp,'node_modules'),process.platform==='win32'?'junction':'dir');
+fs.symlinkSync(path.join(root,'public'),path.join(temp,'public'),process.platform==='win32'?'junction':'dir');
+const base='http://127.0.0.1:3910';
+const env={...process.env,PORT:'3910',RTMP_PORT:'1936',NMS_HTTP_PORT:'8001',FFMPEG_PATH:process.env.FFMPEG_PATH || execFileSync(process.platform==='win32'?'where':'which',['ffmpeg'],{encoding:'utf8'}).trim().split(/\r?\n/)[0]};
+const server=spawn(process.execPath,['server.js'],{cwd:temp,env,stdio:['ignore','pipe','pipe']});
+let logs='';server.stdout.on('data',x=>logs+=x);server.stderr.on('data',x=>logs+=x);
+const sockets=[]; let stream;
+const delay=ms=>new Promise(r=>setTimeout(r,ms));
+async function api(url,method='GET',body,cookie){
+ const r=await fetch(base+url,{method,headers:{'Content-Type':'application/json',...(cookie?{Cookie:cookie}:{})},body:body?JSON.stringify(body):undefined});
+ return {status:r.status,data:await r.json(),cookie:r.headers.get('set-cookie')?.split(';')[0]};
+}
+async function until(fn,timeout=15000){const start=Date.now();while(Date.now()-start<timeout){try{const v=await fn();if(v)return v;}catch{}await delay(200);}throw Error('Tiempo agotado');}
+function socket(cookie){const s=io(base,{transports:['websocket'],extraHeaders:cookie?{Cookie:cookie}:{}});sockets.push(s);return s;}
+const event=(s,name)=>Promise.race([once(s,name).then(x=>x[0]),delay(5000).then(()=>{throw Error('Falta evento '+name);})]);
+(async()=>{
+ await until(async()=> (await api('/api/health')).data.ok);
+ assert.equal((await api('/api/register','POST',{username:'x',password:'prueba123'})).status,400);
+ const a=await api('/api/register','POST',{username:'prueba_uno',password:'prueba123'});assert.equal(a.status,200);
+ const b=await api('/api/register','POST',{username:'prueba_dos',password:'prueba123'});assert.equal(b.status,200);
+ assert.equal((await api('/api/login','POST',{username:'prueba_uno',password:'incorrecta'})).status,401);
+ assert.equal((await api('/api/login','POST',{username:'prueba_uno',password:'prueba123'})).status,200);
+ assert.equal((await api('/api/dashboard')).status,401);
+ assert.equal((await api('/api/channels/prueba_uno/follow','POST',{},a.cookie)).status,400);
+ assert.equal((await api('/api/channels/prueba_uno/follow','POST',{},b.cookie)).data.following,true);
+ assert.equal((await api('/api/following','GET',null,b.cookie)).data.length,1);
+ await api('/api/dashboard','PUT',{title:'Prueba Educación',category:'Educación',bio:'Canal de prueba'},a.cookie);
+ assert.equal((await api('/api/channels?category='+encodeURIComponent('Educación'))).data.length,1);
+ const old=(await api('/api/dashboard','GET',null,a.cookie)).data;
+ const changed=(await api('/api/dashboard/regenerate-key','POST',{},a.cookie)).data;
+ assert.notEqual(old.obs_key,changed.obs_key);
+ console.log('OK: registro, acceso, validación, categorías, seguidores, panel y regeneración de clave');
+ const s1=socket(a.cookie),s2=socket(b.cookie),guest=socket();
+ await Promise.all([event(s1,'connect'),event(s2,'connect'),event(guest,'connect')]);
+ s1.emit('join','prueba_uno');s2.emit('join','prueba_uno');guest.emit('join','prueba_uno');
+ await until(async()=> (await api('/api/channels/prueba_uno')).data.viewers===3);
+ const msg=event(s2,'chat');s1.emit('chat','Hola desde prueba');assert.equal((await msg).text,'Hola desde prueba');
+ const denied=event(guest,'chat:error');guest.emit('chat','no permitido');assert.match(await denied,/sesión/);
+ const spam=event(s1,'chat:error');s1.emit('chat','segundo demasiado rápido');assert.match(await spam,/despacio/);
+ guest.disconnect();await until(async()=> (await api('/api/channels/prueba_uno')).data.viewers===2);
+ console.log('OK: chat entre usuarios, rechazo anónimo, anti-spam y contador al desconectar');
+ const videoArgs=['-hide_banner','-loglevel','error','-re','-f','lavfi','-i','testsrc2=size=640x360:rate=30','-f','lavfi','-i','sine=frequency=440','-t','14','-c:v','libx264','-preset','ultrafast','-b:v','500k','-g','60','-pix_fmt','yuv420p','-c:a','aac','-f','flv'];
+ const bad=spawn(env.FFMPEG_PATH,[...videoArgs,`rtmp://127.0.0.1:1936/live/${old.obs_key}`],{stdio:'ignore'});
+ const badExit=await Promise.race([once(bad,'exit'),delay(5000).then(()=>{bad.kill('SIGKILL');throw Error('Se aceptó clave anterior');})]);assert.notEqual(badExit[0],0);
+ stream=spawn(env.FFMPEG_PATH,[...videoArgs,`rtmp://127.0.0.1:1936/live/${changed.obs_key}`],{stdio:'ignore'});
+ await until(async()=> (await api('/api/channels/prueba_uno')).data.is_live);
+ const manifest=await until(async()=>{const r=await fetch(base+'/media/live/prueba_uno/index.m3u8');return r.ok && await r.text();});
+ assert.match(manifest,/#EXTM3U/);assert.ok(!manifest.includes('sk_'));
+ const segment=manifest.split('\n').find(x=>x.endsWith('.ts'));assert.ok((await fetch(base+'/media/live/prueba_uno/'+segment)).ok);
+ execFileSync(env.FFMPEG_PATH,['-v','error','-i',base+'/media/live/prueba_uno/index.m3u8','-t','2','-f','null','-'],{timeout:15000,stdio:'pipe'});
+ await until(async()=> !(await api('/api/channels/prueba_uno')).data.is_live,20000);
+ await until(async()=> (await api('/api/channels/prueba_uno')).data.vods.length>0);
+ const vod=(await api('/api/channels/prueba_uno')).data.vods[0];assert.ok((await fetch(base+vod.url)).ok);
+ console.log('OK: clave anterior rechazada, RTMP válido, HLS descargable y decodificable, estado offline y VOD MP4');
+ await api('/api/logout','POST',{},a.cookie);
+ const loggedOut=event(s1,'chat:error');s1.emit('chat','sesión cerrada');assert.match(await loggedOut,/sesión/);
+ console.log('OK: cerrar sesión revoca también el acceso al chat');
+ console.log('TODAS LAS PRUEBAS PASARON. Pruebas locales aisladas; no certifican AWS ni OBS en Windows.');
+})().catch(e=>{console.error(e.message);console.error(logs);process.exitCode=1;}).finally(async()=>{
+ for(const s of sockets)s.disconnect();stream?.kill('SIGKILL');server.kill('SIGTERM');
+ await once(server,'exit').catch(()=>{});fs.rmSync(temp,{recursive:true,force:true});
+});

@@ -1,0 +1,27 @@
+{
+  "name": "streamlab",
+  "version": "1.0.0",
+  "description": "Plataforma ligera de streaming en vivo (estilo Twitch) — práctica académica",
+  "main": "server.js",
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server.js",
+    "dev": "node --disable-warning=ExperimentalWarning server.js",
+    "test": "node scripts/test.cjs"
+  },
+  "author": "Irving Jesús Montes López",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4",
+    "socket.io": "^4",
+    "node-media-server": "2.7.0",
+    "bcryptjs": "^3",
+    "dotenv": "^16",
+    "hls.js": "^1"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "devDependencies": {
+    "socket.io-client": "^4.8.1"
+  }
+}
